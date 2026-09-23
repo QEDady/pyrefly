@@ -2240,6 +2240,40 @@ impl<'a> BindingsBuilder<'a> {
         }
     }
 
+    /// Narrow `name` by a single operation, applied on top of `base` rather than on
+    /// top of whatever the name currently resolves to. Passing the binding produced by
+    /// the previous call lets a caller build up a long conjunction one operand at a
+    /// time: because solving `NarrowOp::And` applies its operands in sequence,
+    /// `Narrow(Narrow(x, a), b)` and `Narrow(x, And([a, b]))` describe the same type.
+    /// `match` relies on this to accumulate the negations of preceding cases without
+    /// re-deriving the whole conjunction for every case.
+    ///
+    /// Returns the new binding, or `None` if the name is not in scope.
+    pub fn bind_narrow_op_chained(
+        &mut self,
+        name: &Name,
+        base: Option<Idx<Key>>,
+        op: NarrowOp,
+        op_range: TextRange,
+        use_location: NarrowUseLocation,
+    ) -> Option<Idx<Key>> {
+        let name = Hashed::new(name);
+        let base = match base {
+            Some(base) => base,
+            // Narrowing operations should not pin partial types, but they also should
+            // not permanently block pinning, matching `bind_narrow_ops`.
+            None => self
+                .lookup_name(name, &mut Usage::NonPinningValue(None))
+                .found()?,
+        };
+        let narrowed_idx = self.insert_binding(
+            Key::Narrow(Box::new((name.into_key().clone(), op_range, use_location))),
+            Binding::Narrow(base, Box::new(op), use_location),
+        );
+        self.scopes.narrow_in_current_flow(name, narrowed_idx);
+        Some(narrowed_idx)
+    }
+
     pub fn bind_lambda_param(&mut self, name: &Identifier, kind: LambdaKind, usage: &Usage) {
         let id = LambdaParamId(self.next_lambda_param_id);
         self.next_lambda_param_id += 1;

@@ -909,6 +909,14 @@ impl<'a> BindingsBuilder<'a> {
         // is carried over to the fallback case.
         let mut negated_prev_ops = NarrowOps::new();
         let mut negated_prev_subject: Option<(NarrowOp, TextRange)> = None;
+        // `negated_prev_ops` grows by one operand per case, so binding it to every case
+        // in full would make an N-case `match` cost O(N^2) narrowing operations. Instead
+        // each case narrows by just the operand the previous case contributed, applied on
+        // top of the previous case's binding. Solving `And` applies its operands in
+        // sequence, so the resulting type is the same while the work per case is constant.
+        let mut negated_prev_increment: Option<NarrowOp> = None;
+        let mut negated_prev_scope_idx: Option<Idx<Key>> = None;
+        let mut negated_prev_pattern_idx: Option<Idx<Key>> = None;
         for case in x.cases {
             let MatchCase {
                 pattern,
@@ -923,28 +931,59 @@ impl<'a> BindingsBuilder<'a> {
             if case_always_matches {
                 exhaustive = true;
             }
-            self.bind_narrow_ops(
-                &negated_prev_ops,
-                NarrowUseLocation::Start(case_range),
-                &Usage::NonPinningValue(None),
-            );
+            // The operand the previous case contributed to the running negation, together
+            // with the range recorded for the accumulated narrow. Both the scope narrow
+            // and the projection below extend the previous case's binding with just this
+            // operand instead of rebuilding the whole conjunction.
+            let increment = negated_prev_increment.take();
+            let accumulated_range = match_subject
+                .as_single()
+                .and_then(|subject| negated_prev_ops.0.get(subject.name()))
+                .map(|(_, range)| *range);
+            if let Some(narrowing_subject) = match_subject.as_single()
+                && let Some(op) = increment.clone()
+                && let Some(op_range) = accumulated_range
+            {
+                negated_prev_scope_idx = self.bind_narrow_op_chained(
+                    narrowing_subject.name(),
+                    negated_prev_scope_idx,
+                    op,
+                    op_range,
+                    NarrowUseLocation::Start(case_range),
+                );
+            }
             // First try to project previous narrows directly onto the already-evaluated
             // match subject. This is required for cases like `match self.a`, where the
             // carried narrow is stored as a facet on `self` but the branch-local subject
             // is already the projected `self.a` expression.
-            let case_subject_idx = if let Some(narrowing_subject) = match_subject.as_single()
-                && let Some((narrow_op, op_range)) =
-                    negated_prev_ops.0.get(narrowing_subject.name())
-                && let Some(projected_narrow_op) = narrow_op.rebase_onto_subject(narrowing_subject)
+            //
+            // `rebase_onto_subject` drops the operands that do not constrain the subject,
+            // so projecting one operand at a time onto the previous case's projection
+            // produces the same sequence of surviving operands as projecting the whole
+            // conjunction would.
+            let mut projected_case_subject = None;
+            if let Some(narrowing_subject) = match_subject.as_single()
+                && let Some(op_range) = accumulated_range
             {
-                self.insert_binding(
-                    Key::PatternNarrow(case_range),
-                    Binding::Narrow(
-                        subject_idx,
-                        Box::new(projected_narrow_op),
-                        NarrowUseLocation::Start(*op_range),
-                    ),
-                )
+                if let Some(projected_narrow_op) = increment
+                    .as_ref()
+                    .and_then(|op| op.rebase_onto_subject(narrowing_subject))
+                {
+                    negated_prev_pattern_idx = Some(self.insert_binding(
+                        Key::PatternNarrow(case_range),
+                        Binding::Narrow(
+                            negated_prev_pattern_idx.unwrap_or(subject_idx),
+                            Box::new(projected_narrow_op),
+                            NarrowUseLocation::Start(op_range),
+                        ),
+                    ));
+                }
+                // When this case contributes nothing that projects onto the subject, the
+                // previous case's projection is still the projection of the accumulation.
+                projected_case_subject = negated_prev_pattern_idx;
+            }
+            let case_subject_idx = if let Some(projected_idx) = projected_case_subject {
+                projected_idx
             } else if let Some((narrow_op, op_range)) = &negated_prev_subject {
                 self.insert_binding(
                     Key::PatternNarrow(case_range),
@@ -1044,6 +1083,20 @@ impl<'a> BindingsBuilder<'a> {
                     op.set_allow_never_collapse();
                 }
             }
+            // Record the operand this case adds to the running negation, so the next case
+            // can chain it. This mirrors what `and_all` is about to append: a case that
+            // proves nothing about the subject still contributes a placeholder, so that a
+            // later case cannot claim a narrow this case failed to establish.
+            negated_prev_increment = match_subject.as_single().and_then(|subject| {
+                let name = subject.name();
+                match negated_new_narrow_ops.scope.0.get(name) {
+                    Some((op, _)) => Some(op.clone()),
+                    None if negated_prev_ops.0.contains_key(name) => {
+                        Some(NarrowOp::Atomic(None, AtomicNarrowOp::Placeholder))
+                    }
+                    None => None,
+                }
+            });
             negated_prev_ops.and_all(negated_new_narrow_ops.scope);
             if let Some((new_op, new_range)) = negated_new_narrow_ops.subject {
                 negated_prev_subject = Some(match negated_prev_subject {

@@ -5,6 +5,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use ruff_text_size::TextSize;
+
+use crate::state::require::Require;
+use crate::test::util::TestEnv;
+use crate::test::util::mk_multi_file_state;
+use crate::test::util::testcase_for_macro;
 use crate::testcase;
 
 // At some point in the past, this test took many minutes and consumed 50Gb of RAM.
@@ -281,3 +287,50 @@ def test() -> None:
     f(A())  # E: Argument `A` is not assignable to parameter `x` with type `P1 | P2`
 "#,
 );
+
+/// A `match` statement whose subject is a plain name, with `cases` literal cases.
+/// The last case binds the narrowed subject to `last` so a hover has something to
+/// ask about.
+fn many_case_match(cases: usize) -> String {
+    let mut code = String::new();
+    code.push_str("def f(x: int) -> str:\n    match x:\n");
+    for i in 0..cases - 1 {
+        code.push_str(&format!("        case {i}:\n            return \"c{i}\"\n"));
+    }
+    code.push_str(&format!(
+        "        case {}:\n            last = x\n            return str(last)\n",
+        cases - 1
+    ));
+    code.push_str("        case _:\n            return \"other\"\n");
+    code
+}
+
+// Each case of a `match` narrows the subject by the negation of every preceding case.
+// Accumulating that as one flat conjunction and re-applying it from scratch per case
+// is quadratic. 8000 cases took about 47s per attempt before this was fixed, against
+// the 20s ceiling `testcase_for_macro` enforces; it now takes well under a second.
+// Smaller sizes are not enough to trip that ceiling: 4000 cases took only 11s unfixed.
+#[test]
+fn test_match_many_cases_not_quadratic() {
+    let code = many_case_match(8000);
+    testcase_for_macro(TestEnv::new(), &code, file!(), line!()).unwrap();
+}
+
+// Each case narrows the subject on top of the previous case's result, so the last
+// case sits at the end of a chain as long as the match. Check that the chain still
+// composes to the right type at that depth.
+#[test]
+fn test_match_many_cases_narrow_type_at_last_case() {
+    let cases = 2000;
+    let code = many_case_match(cases);
+    let position = code.find("last = x").unwrap();
+    let (handles, state) = mk_multi_file_state(&[("main", &code)], Require::Everything, false);
+    let handle = handles.get("main").unwrap();
+    let ty = state
+        .transaction()
+        .get_type_at(handle, TextSize::new(position as u32));
+    assert_eq!(
+        ty.map(|t| t.to_string()),
+        Some(format!("Literal[{}]", cases - 1))
+    );
+}
