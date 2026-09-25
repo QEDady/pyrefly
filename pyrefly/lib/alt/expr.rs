@@ -438,6 +438,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .then(|| self.get_hashed(Hashed::new(&anon_key)).ty().clone())
     }
 
+    fn error_invalid_annotation_call(&self, call: &ExprCall, errors: &ErrorCollector) -> Type {
+        let message = if Self::is_type_not_implemented_call(call) {
+            "Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?"
+                .to_owned()
+        } else {
+            "Function call cannot be used in annotations".to_owned()
+        };
+        self.error(errors, call.range(), ErrorKind::InvalidAnnotation, message)
+    }
+
     /// Infer a type for an expression, with an optional type hint that influences the inferred type.
     /// The inferred type is also checked against the hint.
     /// Convenience wrapper around `expr_with_options`.
@@ -990,17 +1000,20 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if let Some(type_form_context) = type_form_context {
                     if type_form_context.allows_type_level_dsl_call() {
                         let callee = self.expr_infer(&x.func, &self.error_swallower());
-                        let ty =
-                            self.parse_type_level_dsl_call(x, &callee, type_form_context, errors);
-                        return self.heap.mk_type_of(ty);
+                        if Self::is_type_level_dsl_callee(&callee)
+                            || type_form_context.is_shape_context()
+                        {
+                            let ty = self.parse_type_level_dsl_call(
+                                x,
+                                &callee,
+                                type_form_context,
+                                errors,
+                            );
+                            return self.heap.mk_type_of(ty);
+                        }
                     }
                     if type_form_context != TypeFormContext::BaseClassList {
-                        return self.error(
-                            errors,
-                            x.range(),
-                            ErrorKind::InvalidAnnotation,
-                            "Function call cannot be used in annotations".to_owned(),
-                        );
+                        return self.error_invalid_annotation_call(x, errors);
                     }
                 }
                 let prepared = self.prepare_expr_call(x, errors);
@@ -4700,13 +4713,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         context: DimensionExprContext,
         require_nonnegative: bool,
     ) -> Result<Vec<Type>, DimensionExprError> {
+        let shape_context = TypeFormContext::ShapeTypeArgument(&type_form_context);
         let mut dims = Vec::new();
         for arg in args {
             let dim = if let Expr::Call(call) = arg
-                && type_form_context.allows_type_level_dsl_call()
+                && shape_context.allows_type_level_dsl_call()
             {
                 let callee = self.expr_infer(&call.func, &self.error_swallower());
-                let ty = self.parse_type_level_dsl_call(call, &callee, type_form_context, errors);
+                let ty = self.parse_type_level_dsl_call(call, &callee, shape_context, errors);
                 if let Type::TypeLevelDslCall(call) = &ty
                     && call.result_domain() != Some(TypeShapeDslDomain::Int)
                 {
@@ -4722,7 +4736,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ty
                 }
             } else {
-                self.parse_dimension_expr_with_context(arg, errors, context, type_form_context)?
+                self.parse_dimension_expr_with_context(arg, errors, context, shape_context)?
             };
             let simplified = canonicalize(dim);
 
@@ -4901,6 +4915,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> Vec<Type> {
         let type_argument_context = TypeFormContext::TypeArgument(&type_form_context);
+        let shape_type_argument_context = TypeFormContext::ShapeTypeArgument(&type_form_context);
         if !self.solver().config.tensor_shapes {
             return args.map(|arg| self.expr_untype(arg, type_argument_context, errors));
         }
@@ -4925,21 +4940,34 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         args.iter()
             .enumerate()
             .map(|(idx, arg)| {
+                let is_shape_param = param_for_arg(idx).is_some_and(|param| {
+                    param.kind() == QuantifiedKind::IntVar
+                        || (param.kind() == QuantifiedKind::TypeVar
+                            && is_int_tuple_bound(
+                                &param.upper_bound(self.stdlib, self.heap),
+                                &int_type,
+                            ))
+                });
+                let arg_context = if is_shape_param {
+                    shape_type_argument_context
+                } else {
+                    type_argument_context
+                };
                 if let Some(param) = param_for_arg(idx) {
                     if !matches!(arg, Expr::Starred(_)) && param.kind() == QuantifiedKind::IntVar {
-                        return self.parse_int_var_argument(arg, type_argument_context, errors);
+                        return self.parse_int_var_argument(arg, arg_context, errors);
                     }
                     if param.kind() == QuantifiedKind::TypeVar
                         && let Expr::List(ExprList { elts, .. }) = arg
                         && is_int_tuple_bound(&param.upper_bound(self.stdlib, self.heap), &int_type)
                     {
                         return self
-                            .parse_int_tuple_shape_args(elts, type_argument_context, errors)
+                            .parse_int_tuple_shape_args(elts, arg_context, errors)
                             .map(|shape| shape.to_shape_arg_type())
                             .unwrap_or_else(Type::any_error);
                     }
                 }
-                self.expr_untype(arg, type_argument_context, errors)
+                self.expr_untype(arg, arg_context, errors)
             })
             .collect()
     }
@@ -5220,12 +5248,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let mut shape_arg_carrier = None;
         let mut shape_arg_failed_to_parse = false;
         let type_argument_context = TypeFormContext::TypeArgument(&type_form_context);
+        let shape_type_argument_context = TypeFormContext::ShapeTypeArgument(&type_form_context);
         let class_targs: Vec<Type> = args
             .iter()
             .enumerate()
             .map(|(i, arg)| match arg {
                 Expr::List(ExprList { elts, .. }) if i == shape_idx => {
-                    match self.parse_int_tuple_shape_args(elts, type_argument_context, errors) {
+                    match self.parse_int_tuple_shape_args(elts, shape_type_argument_context, errors) {
                         Some(shape) => {
                             let carrier = shape_to_tuple_carrier(&shape);
                             shape_arg_carrier = Some(shape.to_shape_arg_type());
@@ -5246,7 +5275,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         shape_arg_carrier = Some(IntTuple::shapeless().to_shape_arg_type());
                         shape_validation_arg(&carrier)
                     } else {
-                        match self.expr_untype(arg, type_argument_context, errors) {
+                        let arg_context = if i == shape_idx {
+                            shape_type_argument_context
+                        } else {
+                            type_argument_context
+                        };
+                        match self.expr_untype(arg, arg_context, errors) {
                             ty if i == shape_idx && ty.is_error() => {
                                 shape_arg_failed_to_parse = true;
                                 ty
@@ -5344,7 +5378,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         type_form_context: TypeFormContext<'_>,
         errors: &ErrorCollector,
     ) -> Type {
-        let argument_context = TypeFormContext::TypeArgument(&type_form_context);
+        let argument_context = TypeFormContext::ShapeTypeArgument(&type_form_context);
         let Some(shape) = self.parse_int_tuple_shape_args(args, argument_context, errors) else {
             return self.heap.mk_type_of(Type::any_error());
         };
@@ -5373,7 +5407,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return Type::any_error();
         }
 
-        let argument_context = TypeFormContext::TypeArgument(&type_form_context);
+        let argument_context = TypeFormContext::ShapeTypeArgument(&type_form_context);
         let Some(dims) = self.parse_dimension_list(args, argument_context, errors) else {
             return Type::any_error();
         };

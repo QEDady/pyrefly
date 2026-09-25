@@ -215,6 +215,8 @@ pub enum TypeFormContext<'a> {
     VarAnnotation(AnnAssignHasValue),
     /// Type argument for a generic.
     TypeArgument(&'a TypeFormContext<'a>),
+    /// Type argument for a shape parameter or dimension.
+    ShapeTypeArgument(&'a TypeFormContext<'a>),
     /// Type argument for `builtins.type`.
     TypeArgumentForType(&'a TypeFormContext<'a>),
     /// Type argument for the return position of a `Callable` type.
@@ -770,6 +772,25 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
+    pub(crate) fn is_type_not_implemented_call(call: &ExprCall) -> bool {
+        let is_type = match &*call.func {
+            Expr::Name(name) => name.id == "type",
+            Expr::Attribute(attr) => attr.attr.id == "type",
+            _ => false,
+        };
+        if !is_type {
+            return false;
+        }
+        if call.arguments.args.len() != 1 || !call.arguments.keywords.is_empty() {
+            return false;
+        }
+        match &call.arguments.args[0] {
+            Expr::Name(name) => name.id == "NotImplemented",
+            Expr::Attribute(attr) => attr.attr.id == "NotImplemented",
+            _ => false,
+        }
+    }
+
     pub(crate) fn has_valid_annotation_syntax(&self, x: &Expr, errors: &ErrorCollector) -> bool {
         if let Some(problem) = Ast::annotation_syntax_problem(x) {
             let message = if let Expr::BinOp(ExprBinOp { op, .. }) = x {
@@ -777,6 +798,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     "Binary operation `{}` cannot be used in annotations",
                     op.as_str()
                 )
+            } else if let Expr::Call(call) = x
+                && Self::is_type_not_implemented_call(call)
+            {
+                "Function call cannot be used in annotations. Did you mean `types.NotImplementedType`?"
+                    .to_owned()
             } else {
                 format!("{problem} cannot be used in annotations")
             };

@@ -60,8 +60,19 @@ impl TypeFormContext<'_> {
     pub(crate) fn allows_type_level_dsl_call(self) -> bool {
         match self {
             Self::ReturnAnnotation | Self::TypeLevelLambdaReturn(_) => true,
+            Self::TypeArgument(parent)
+            | Self::ShapeTypeArgument(parent)
+            | Self::TupleElement(parent)
+            | Self::UnionMember(parent) => parent.allows_type_level_dsl_call(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_shape_context(self) -> bool {
+        match self {
+            Self::ShapeTypeArgument(_) | Self::TypeLevelLambdaReturn(_) => true,
             Self::TypeArgument(parent) | Self::TupleElement(parent) | Self::UnionMember(parent) => {
-                parent.allows_type_level_dsl_call()
+                parent.is_shape_context()
             }
             _ => false,
         }
@@ -1009,6 +1020,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ))
         } else {
             None
+        }
+    }
+
+    pub(crate) fn is_type_level_dsl_callee(callee: &Type) -> bool {
+        match callee.callee_kind() {
+            Some(CalleeKind::Function(FunctionKind::TypeShapeDsl(..))) => true,
+            Some(CalleeKind::Function(FunctionKind::Def(id)))
+                if id.has_toplevel_qname("shape_extensions", "index_shape") =>
+            {
+                true
+            }
+            _ => false,
         }
     }
 
