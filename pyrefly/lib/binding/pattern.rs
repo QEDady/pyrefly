@@ -20,6 +20,7 @@ use ruff_python_ast::PatternKeyword;
 use ruff_python_ast::StmtMatch;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
+use starlark_map::Hashed;
 use vec1::Vec1;
 
 use crate::binding::binding::Binding;
@@ -909,6 +910,12 @@ impl<'a> BindingsBuilder<'a> {
         // is carried over to the fallback case.
         let mut negated_prev_ops = NarrowOps::new();
         let mut negated_prev_subject: Option<(NarrowOp, TextRange)> = None;
+        // Each case adds at most one op to `negated_prev_ops`. Re-binding the whole conjunction
+        // in every case is quadratic in the number of cases, so instead we narrow the previous
+        // case's bindings by just the op it added.
+        let mut negated_last_op: Option<NarrowOp> = None;
+        let mut negated_prev_idx: Option<Idx<Key>> = None;
+        let mut negated_prev_pattern_idx: Option<Idx<Key>> = None;
         for case in x.cases {
             let MatchCase {
                 pattern,
@@ -923,28 +930,44 @@ impl<'a> BindingsBuilder<'a> {
             if case_always_matches {
                 exhaustive = true;
             }
-            self.bind_narrow_ops(
-                &negated_prev_ops,
-                NarrowUseLocation::Start(case_range),
-                &Usage::NonPinningValue(None),
-            );
-            // First try to project previous narrows directly onto the already-evaluated
-            // match subject. This is required for cases like `match self.a`, where the
-            // carried narrow is stored as a facet on `self` but the branch-local subject
-            // is already the projected `self.a` expression.
-            let case_subject_idx = if let Some(narrowing_subject) = match_subject.as_single()
-                && let Some((narrow_op, op_range)) =
-                    negated_prev_ops.0.get(narrowing_subject.name())
-                && let Some(projected_narrow_op) = narrow_op.rebase_onto_subject(narrowing_subject)
+            if let Some(narrowing_subject) = match_subject.as_single()
+                && let Some((_, op_range)) = negated_prev_ops.0.get(narrowing_subject.name())
             {
-                self.insert_binding(
-                    Key::PatternNarrow(case_range),
-                    Binding::Narrow(
-                        subject_idx,
-                        Box::new(projected_narrow_op),
-                        NarrowUseLocation::Start(*op_range),
-                    ),
-                )
+                let name = Hashed::new(narrowing_subject.name());
+                if let Some(op) = negated_last_op.take() {
+                    let base = negated_prev_idx.or_else(|| {
+                        self.lookup_name(name, &mut Usage::NonPinningValue(None))
+                            .found()
+                    });
+                    if let Some(base) = base {
+                        negated_prev_idx = Some(self.bind_narrow_op(
+                            name,
+                            base,
+                            op.clone(),
+                            *op_range,
+                            NarrowUseLocation::Start(case_range),
+                        ));
+                    }
+                    // Also project the op directly onto the already-evaluated match subject.
+                    // This is required for cases like `match self.a`, where the carried narrow
+                    // is stored as a facet on `self` but the branch-local subject is already
+                    // the projected `self.a` expression.
+                    if let Some(projected_op) = op.rebase_onto_subject(narrowing_subject) {
+                        negated_prev_pattern_idx = Some(self.insert_binding(
+                            Key::PatternNarrow(case_range),
+                            Binding::Narrow(
+                                negated_prev_pattern_idx.unwrap_or(subject_idx),
+                                Box::new(projected_op),
+                                NarrowUseLocation::Start(*op_range),
+                            ),
+                        ));
+                    }
+                } else if let Some(idx) = negated_prev_idx {
+                    self.scopes.narrow_in_current_flow(name, idx);
+                }
+            }
+            let case_subject_idx = if let Some(idx) = negated_prev_pattern_idx {
+                idx
             } else if let Some((narrow_op, op_range)) = &negated_prev_subject {
                 self.insert_binding(
                     Key::PatternNarrow(case_range),
@@ -1044,6 +1067,13 @@ impl<'a> BindingsBuilder<'a> {
                     op.set_allow_never_collapse();
                 }
             }
+            negated_last_op = match_subject.as_single().and_then(|narrowing_subject| {
+                negated_new_narrow_ops
+                    .scope
+                    .0
+                    .get(narrowing_subject.name())
+                    .map(|(op, _)| op.clone())
+            });
             negated_prev_ops.and_all(negated_new_narrow_ops.scope);
             if let Some((new_op, new_range)) = negated_new_narrow_ops.subject {
                 negated_prev_subject = Some(match negated_prev_subject {

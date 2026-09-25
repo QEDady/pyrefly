@@ -164,7 +164,7 @@ pub enum NameLookupResult {
 }
 
 impl NameLookupResult {
-    fn found(self) -> Option<Idx<Key>> {
+    pub fn found(self) -> Option<Idx<Key>> {
         match self {
             NameLookupResult::Found { idx, .. } => Some(idx),
             NameLookupResult::NotFound => None,
@@ -2340,13 +2340,26 @@ impl<'a> BindingsBuilder<'a> {
             // as Undetermined so a subsequent non-narrowing read can still pin.
             let mut narrowing_usage = Usage::non_pinning_value_from(usage);
             if let Some(initial_idx) = self.lookup_name(name, &mut narrowing_usage).found() {
-                let narrowed_idx = self.insert_binding(
-                    Key::Narrow(Box::new((name.into_key().clone(), *op_range, use_location))),
-                    Binding::Narrow(initial_idx, Box::new(op.clone()), use_location),
-                );
-                self.scopes.narrow_in_current_flow(name, narrowed_idx);
+                self.bind_narrow_op(name, initial_idx, op.clone(), *op_range, use_location);
             }
         }
+    }
+
+    /// Narrow `name` in the current flow to `base` narrowed by `op`.
+    pub fn bind_narrow_op(
+        &mut self,
+        name: Hashed<&Name>,
+        base: Idx<Key>,
+        op: NarrowOp,
+        op_range: TextRange,
+        use_location: NarrowUseLocation,
+    ) -> Idx<Key> {
+        let narrowed_idx = self.insert_binding(
+            Key::Narrow(Box::new((name.into_key().clone(), op_range, use_location))),
+            Binding::Narrow(base, Box::new(op), use_location),
+        );
+        self.scopes.narrow_in_current_flow(name, narrowed_idx);
+        narrowed_idx
     }
 
     pub fn bind_lambda_param(&mut self, name: &Identifier, kind: LambdaKind, usage: &Usage) {

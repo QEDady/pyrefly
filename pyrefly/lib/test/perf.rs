@@ -6,6 +6,7 @@
  */
 
 use crate::test::util::TestEnv;
+use crate::test::util::testcase_for_macro;
 use crate::testcase;
 
 // At some point in the past, this test took many minutes and consumed 50Gb of RAM.
@@ -301,4 +302,15 @@ fn test_deeply_nested_expression_is_rejected() {
         "got: {:?}",
         errors[0].msg()
     );
+}
+
+// Each case of a `match` narrows the subject by the negation of every preceding case.
+// Re-applying all of them in every case used to make this take about 46s.
+#[test]
+fn test_match_with_many_cases() {
+    let cases: String = (0..8000)
+        .map(|i| format!("        case {i}:\n            pass\n"))
+        .collect();
+    let code = format!("def f(x: int):\n    match x:\n{cases}");
+    testcase_for_macro(TestEnv::new(), &code, file!(), line!()).unwrap();
 }
