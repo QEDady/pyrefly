@@ -14520,6 +14520,21 @@ def conditional_both_deferred(a: Int, b: Int, choose: bool) -> Int:
     out = (a + 1) if choose else (b + 2)
     return out
 
+@type_shape_dsl_function
+def dead_is_int_value_branch(shape: IntTuple, axes: tuple[int, ...] | None) -> IntTuple:
+    if dsl.is_int_value(axes):
+        norm = axes + len(shape) if axes < 0 else axes
+        return shape[:norm]
+    return shape
+
+@type_shape_dsl_function
+def redundant_not_none_flag_int(shape: IntTuple, axis: int) -> IntTuple:
+    if axis is not None:
+        if axis < 0:
+            return shape[1:]
+        return shape[:1]
+    return shape
+
 def apply_expand_if_else[S: IntTuple, A: Flag[int]](x: Array[S], axis: A) -> Array[expand_dims_if_else(S, A)]: ...
 def apply_expand_conditional[S: IntTuple, A: Flag[int | tuple[int, ...] | None]](x: Array[S], axis: A = None) -> Array[expand_dims_conditional(S, A)]: ...
 def apply_reduce[S: IntTuple, A: Flag[int]](x: Array[S], axis: A) -> Array[reduce_normalized_axis(S, A)]: ...
@@ -14533,6 +14548,8 @@ def apply_optional_extent[S: IntTuple, N: Int | None = None](x: Array[S], n: N =
 def apply_optional_symbolic[S: IntTuple, N: IntVar](x: Array[S], n: DimBox[Int[N]]) -> DimBox[optional_extent(S, Int[N])]: ...
 def apply_concrete_branch[D: Int, N: Int | None = None](d: DimBox[D], n: N = None) -> Array[concrete_branch_dimension(D, N)]: ...
 def apply_both_deferred[A: Int, B: Int, C: Flag[bool]](a: DimBox[A], b: DimBox[B], choose: C) -> DimBox[conditional_both_deferred(A, B, C)]: ...
+def apply_dead_is_int[S: IntTuple, A: Flag[tuple[int, ...] | None]](x: Array[S], axes: A = None) -> Array[dead_is_int_value_branch(S, A)]: ...
+def apply_redundant_not_none[S: IntTuple, A: Flag[int]](x: Array[S], axis: A) -> Array[redundant_not_none_flag_int(S, A)]: ...
 
 def check[N: IntVar, M: IntVar, Mid: IntTuple](
     x: Array[IntTuple[3, 5]],
@@ -14542,6 +14559,7 @@ def check[N: IntVar, M: IntVar, Mid: IntTuple](
     dm: DimBox[Int[M]],
     d_gradual: DimBox[Int],
     broad_axis: int,
+    broad_axes: tuple[int, ...],
     broad_bool: bool,
 ) -> None:
     assert_type(apply_expand_if_else(x, 1), Array[IntTuple[3, 1, 5]])
@@ -14588,6 +14606,14 @@ def check[N: IntVar, M: IntVar, Mid: IntTuple](
 
     assert_type(apply_both_deferred(dn, dm, True), DimBox[Int[N + 1]])
     assert_type(apply_both_deferred(dn, dm, False), DimBox[Int[M + 2]])
+
+    assert_type(apply_dead_is_int(x, (0,)), Array[IntTuple[3, 5]])
+    assert_type(apply_dead_is_int(x), Array[IntTuple[3, 5]])
+    assert_type(apply_dead_is_int(x, broad_axes), Array[IntTuple])
+
+    assert_type(apply_redundant_not_none(x, 1), Array[IntTuple[3]])
+    assert_type(apply_redundant_not_none(x, -1), Array[IntTuple[5]])
+    assert_type(apply_redundant_not_none(x, broad_axis), Array[IntTuple])
 "#,
 );
 
@@ -14712,6 +14738,13 @@ def non_integer_flag_branch(d: Int, label: str, choose: bool) -> Int:
         out = d + 1
     else:
         out = label
+    return d
+
+@type_shape_dsl_function
+def is_none_narrowed_flag_int_local(d: Int, p: int, choose: bool) -> Int:
+    x = p if choose else 1
+    if x is None:
+        return d + x  # E: dimension arithmetic operands must be annotated as `Int`, as `Int | None` narrowed to exclude `None`, or as a compatible integer Flag
     return d
 "#,
 );

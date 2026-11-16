@@ -122,6 +122,14 @@ pub enum TypeShapeDslInputDomain {
     NamedInts,
 }
 
+/// The domain accepted by scalar and sequence narrowing operations. Boolean conditions are
+/// validated separately against `Flag[bool]`.
+pub fn type_shape_dsl_narrowable_flag_domain() -> FlagDomain {
+    FlagDomain::of(FlagMember::Int)
+        .join(FlagDomain::of(FlagMember::IntTuple))
+        .join(FlagDomain::of(FlagMember::NoneType))
+}
+
 impl TypeShapeDslInputDomain {
     /// Whether a parameter in this domain may be used as a value in `result` after narrowing.
     pub fn can_use_as(
@@ -136,7 +144,10 @@ impl TypeShapeDslInputDomain {
     }
 
     /// Which integer domain a parameter in this domain belongs to after `narrowing`, if any.
-    fn integer_domain(self, narrowing: TypeShapeDslParameterNarrowing) -> Option<DslIntegerDomain> {
+    pub fn integer_domain(
+        self,
+        narrowing: TypeShapeDslParameterNarrowing,
+    ) -> Option<DslIntegerDomain> {
         if self.can_use_as(TypeShapeDslDomain::Int, narrowing) {
             return Some(DslIntegerDomain::Dimension);
         }
@@ -144,10 +155,10 @@ impl TypeShapeDslInputDomain {
             return None;
         };
         let is_flag_int = if narrowing == TypeShapeDslParameterNarrowing::Integer {
-            let narrowable = FlagDomain::of(FlagMember::Int)
-                .join(FlagDomain::of(FlagMember::IntTuple))
-                .join(FlagDomain::of(FlagMember::NoneType));
-            domain.is_subset_of(narrowable)
+            // Any domain accepted by `dsl.is_int_value(...)` (`int | tuple[int, ...] | None` or a
+            // subset like `tuple[int, ...] | None`) may be used as `Flag[int]` inside the narrowed
+            // branch; if `int` wasn't in the declared union, that branch is simply dead at runtime.
+            domain.is_subset_of(type_shape_dsl_narrowable_flag_domain())
         } else {
             narrowing != TypeShapeDslParameterNarrowing::IsNone
                 && domain == FlagDomain::of(FlagMember::Int)
@@ -9329,11 +9340,7 @@ mod tests {
         };
         let int = TypeShapeDslInputDomain::Value(TypeShapeDslDomain::Int);
         let optional_int = TypeShapeDslInputDomain::OptionalInt;
-        let broad_flag = TypeShapeDslInputDomain::Flag(
-            FlagDomain::of(FlagMember::Int)
-                .join(FlagDomain::of(FlagMember::IntTuple))
-                .join(FlagDomain::of(FlagMember::NoneType)),
-        );
+        let broad_flag = TypeShapeDslInputDomain::Flag(type_shape_dsl_narrowable_flag_domain());
 
         for actual in [optional_int, broad_flag] {
             assert_eq!(
