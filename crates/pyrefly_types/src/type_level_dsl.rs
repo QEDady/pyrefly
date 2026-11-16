@@ -5655,7 +5655,30 @@ impl<'a, F: Fn(&Expr) -> Option<TypeShapeDslIntrinsic>> DslValidator<'a, F> {
                 self.resolve_deferred_integer(index, DslIntegerDomain::Flag)?;
                 Some(flag)
             }
-            (left, right) => left.join(right),
+            (left, right) => {
+                left.join(right)
+                    .filter(|joined| match (joined, self.parameter_domains) {
+                        // A `ValueSet` cannot mix `Flag` parameters with `Int` / `Int | None` (or
+                        // shape) parameters; rejecting mixed sources here keeps 3+ branch merges
+                        // independent of branch order.
+                        (DslStaticKind::ValueSet { sources, .. }, Some(domains)) => {
+                            let all_flag = sources.parameter_uses.iter().all(|use_| {
+                                matches!(domains[use_.parameter], TypeShapeDslInputDomain::Flag(_))
+                            });
+                            let all_int_like =
+                                sources.non_parameter_kinds & !(FLAG_INT | FLAG_NONE) == 0
+                                    && sources.parameter_uses.iter().all(|use_| {
+                                        matches!(
+                                            domains[use_.parameter],
+                                            TypeShapeDslInputDomain::Value(TypeShapeDslDomain::Int)
+                                                | TypeShapeDslInputDomain::OptionalInt
+                                        )
+                                    });
+                            all_flag || all_int_like
+                        }
+                        _ => true,
+                    })
+            }
         })
     }
 

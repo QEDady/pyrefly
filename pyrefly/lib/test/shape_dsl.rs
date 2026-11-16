@@ -14746,5 +14746,30 @@ def is_none_narrowed_flag_int_local(d: Int, p: int, choose: bool) -> Int:
     if x is None:
         return d + x  # E: dimension arithmetic operands must be annotated as `Int`, as `Int | None` narrowed to exclude `None`, or as a compatible integer Flag
     return d
+
+@type_shape_dsl_function
+def flag_branches_then_dimension(shape: IntTuple, d: Int, e: int, c1: bool, c2: bool) -> IntTuple:
+    if c1:  # E: all continuing branch assignments to a local must have the same value domain
+        out = e + 1
+    elif c2:
+        out = e
+    else:
+        out = d
+    return shape
+
+@type_shape_dsl_function
+def dimension_then_flag_branches(shape: IntTuple, d: Int, e: int, c1: bool, c2: bool) -> IntTuple:
+    if not c1 and not c2:  # E: all continuing branch assignments to a local must have the same value domain
+        out = d
+    elif c1:
+        out = e + 1
+    else:
+        out = e
+    return shape
+
+@type_shape_dsl_function
+def bool_literal_and_dimension(shape: IntTuple, d: Int, choose: bool) -> IntTuple:
+    out = True if choose else d  # E: conditional expression branches must have the same value domain
+    return shape
 "#,
 );
